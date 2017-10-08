@@ -3,14 +3,20 @@ static const int speakerPin1=3;
 static const int speakerPin2=4;
 static const int wifiResetPin=2;
 static const unsigned apJoinTimeout=30000u;
+static const unsigned statusRequestPeriod=5000u;
 static const unsigned getStatusTimeout=1000u;
 
-//const char ssid[] = "gzabrodina";
-//const char pass[] = "pusya756nadya";
-const char ssid[] = "az-theater";
-const char pass[] = "internal17";
-const char hostname[]="drunken-lamp";
 
+struct WiFiCredentials {
+  const char *ssid;
+  const char *pass;
+};
+
+const struct WiFiCredentials wifiCredentials[]={
+  {"az-theater", "internal17"},
+  {"gzabrodina", "pusya756nadya"}
+}; 
+const int NumKnowWifiNets=sizeof(wifiCredentials)/sizeof(*wifiCredentials);
 
 void lamp_ctrl_on();
 void lamp_ctrl_off();
@@ -68,6 +74,8 @@ class Buffer {
 };
 
 class WiFiServer {
+  int wifiNetIndex;  
+
   byte bufferdata[500];  
   Buffer buf;
   int step_number;
@@ -75,7 +83,7 @@ class WiFiServer {
   unsigned long statusWatchDog;
   byte waitForStatusReply, serverCreated;
   unsigned long statusReplyWatchDog;
-  int lastClientId, clientId, dataLen,sc;
+  int lastClientId, clientId, dataLen,sc, badStatusCnt;
 
   byte *dataToSend; int lenDataToSend;
  public:
@@ -101,7 +109,7 @@ class WiFiServer {
 
 
 
-  WiFiServer(): buf(bufferdata,sizeof(bufferdata)) { step_number=0;  sc=0; lastClientId=-1; }
+  WiFiServer(): buf(bufferdata,sizeof(bufferdata)) { step_number=0;  sc=0; lastClientId=-1; wifiNetIndex=0; }
 
   void sendData(byte *data, int datalen) {
       dataToSend=data; lenDataToSend=datalen;
@@ -166,10 +174,11 @@ class WiFiServer {
     END_STEP
     STEP
       Serial.print("\r\nAT+CWJAP=\"");
-      Serial.print(ssid);
+      Serial.print(wifiCredentials[wifiNetIndex].ssid);
       Serial.print("\",\"");
-      Serial.print(pass);
+      Serial.print(wifiCredentials[wifiNetIndex].pass);
       Serial.print("\"\r\n");
+      if (++wifiNetIndex>=NumKnowWifiNets) wifiNetIndex=0;  // next WiFi net
     END_STEP
     STEP
       WAIT_FOR_REPLY("GOT IP",apJoinTimeout);
@@ -178,16 +187,17 @@ class WiFiServer {
       WAIT_FOR_REPLY("\r\nOK\r\n",5000);
     END_STEP
     STEP
-      statusWatchDog=millis()-apJoinTimeout+1000;
+      if (--wifiNetIndex<0) wifiNetIndex=NumKnowWifiNets-1;  // keep current WiFi net in the case of success connection
+      statusWatchDog=millis();
       waitForStatusReply=0;
-      serverCreated=0;
+      serverCreated=0; badStatusCnt=0;
     END_STEP
 
     LOOP
       STEP
-        if (!dataToSend && millis()-statusWatchDog>=apJoinTimeout) { // send status request
+        if (!dataToSend && !waitForStatusReply && millis()-statusWatchDog>=statusRequestPeriod) { // send status request
           Serial.print("\r\nAT+CIPSTATUS\r\n");
-          statusWatchDog=statusReplyWatchDog=millis();
+          statusReplyWatchDog=millis();
           waitForStatusReply=1;
         }
       END_STEP
@@ -209,14 +219,22 @@ class WiFiServer {
         if (y==1) GOTO(labelDataReceiving);
         if (x==0 && y==0) buf.get();
         if (waitForStatusReply && millis()-statusReplyWatchDog>=getStatusTimeout) {
-            RESTART_STEPS;
+            if (++badStatusCnt>=5) {
+              RESTART_STEPS;
+            } else {
+              waitForStatusReply=0;
+              statusWatchDog=millis();
+            }
         }
         GOTO(labelContinue);
       END_STEP
 
   labelStatusReceiving:
       STEP
-        if (!waitForStatusReply) GOTO(labelContinue);
+        if (!waitForStatusReply) {
+          statusWatchDog=millis();
+          GOTO(labelContinue);
+        }
         if (!buf.available()) {
           RETRY_STEP(100);
           RESTART_STEPS;
@@ -224,21 +242,30 @@ class WiFiServer {
         char status=buf.get();
         switch (status) {
           case '2': case '3': case '4': // joined AP
-            waitForStatusReply=0;
             if (!serverCreated) {
               Serial.print("\r\nAT+CIPSERVER=1,8080\r\n");
               serverCreated=1;
               lamp_ctrl_test();
             }
+            waitForStatusReply=0;
+            badStatusCnt=0;
+            statusWatchDog=millis();
             GOTO(labelContinue);
           case '5': // No access to AP
           default: // wrong reply
-            RESTART_STEPS;
+            if (++badStatusCnt>=5) {
+              RESTART_STEPS;
+            } else {
+              waitForStatusReply=0;
+              statusWatchDog=millis();
+              GOTO(labelContinue);
+            }
         }
       END_STEP
 
   labelDataReceiving:
       STEP
+        Serial.print("\r\n+IRD\r\n");
         clientId=0;
       END_STEP
       STEP
@@ -288,12 +315,18 @@ class WiFiServer {
         }
       END_STEP
       STEP
+        Serial.print("\r\n+IRD END\r\n");
         GOTO(labelContinue);
       END_STEP
 
   labelSendData:
-    STEP_DELAYED(500)
+    STEP_DELAYED(100)
       for (int i=0; i<lenDataToSend; i++) Serial.print((char)dataToSend[i]);
+    END_STEP
+    STEP_DELAYED(100)
+      Serial.print("\r\nAT+CIPCLOSE=");
+      Serial.print(lastClientId);
+      Serial.print("\r\n");
       dataToSend=0;
       GOTO(labelContinue);
     END_STEP
@@ -308,7 +341,7 @@ class WiFiServer {
 WiFiServer wifiServer;
 
 class HttpServer {
-  byte bufferdata[50];  
+  byte bufferdata[250];  
   Buffer buf;
   int step_number;
   unsigned long step_time;
@@ -319,6 +352,7 @@ class HttpServer {
     const static byte httpReply[]=
       "HTTP/1.0 200 OK\r\n"
       "Content-Type: text/plain\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
       "Content-Length: 4\r\n"
       "\r\n"
       "LAMP\r\n";
@@ -337,31 +371,31 @@ class HttpServer {
       END_STEP
       STEP
         int wrongPath=1;
-        switch (BUF_MATCH("on ")) {
+        switch (BUF_MATCH("on.")) {
           case 1: sendReply(); lamp_ctrl_on(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("off ")) {
+        switch (BUF_MATCH("off.")) {
           case 1: sendReply(); lamp_ctrl_off(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("sound1 ")) {
+        switch (BUF_MATCH("sound1.")) {
           case 1: sendReply(); lamp_ctrl_sound1(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("sound2 ")) {
+        switch (BUF_MATCH("sound2.")) {
           case 1: sendReply(); lamp_ctrl_sound2(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("burn ")) {
+        switch (BUF_MATCH("burn.")) {
           case 1: sendReply(); lamp_ctrl_burn(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("test ")) {
+        switch (BUF_MATCH("test.")) {
           case 1: sendReply(); lamp_ctrl_test(); EXIT_STEP
           case 2: wrongPath=0;
         }
-        switch (BUF_MATCH("blink ")) {
+        switch (BUF_MATCH("blink.")) {
           case 1: sendReply(); lamp_ctrl_blink(); EXIT_STEP
           case 2: wrongPath=0;
         }
@@ -399,6 +433,10 @@ public:
 
   labeltest:
     STEP
+      REPEAT_STEP
+    END_STEP
+#if 0    
+    STEP
       analogWrite(lampCtrlPin, 128);
       duration=millis();
     END_STEP
@@ -420,6 +458,7 @@ public:
         digitalWrite(speakerPin2, LOW);
         GOTO(labelOff);
    END_STEP
+#endif   
 
   labelBlink:
     LOOP
