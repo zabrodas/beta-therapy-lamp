@@ -426,7 +426,7 @@ public:
       case 3: request=0; GOTO(labelSound1);
       case 4: request=0; GOTO(labelSound2);
       case 5: request=0; GOTO(labelburn);
-      case 6: request=0; GOTO(labeltest);
+      case 6: request=0; return; // GOTO(labeltest);
       case 7: request=0; GOTO(labelBlink);
       default: request=0; return;
     }
